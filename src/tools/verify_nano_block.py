@@ -1,34 +1,45 @@
-"""Tool: confirm a Nano (XNO) payment by verifying its block off-chain.
+"""Tool: confirm a Nano (XNO) payment by verifying the customer's send block.
 
-Nano is verification == settlement: an exact-amount send receivable TO the
-merchant's own nano_ address IS the settlement. No facilitator, no gas, no
+Nano is verification == settlement: a confirmed send block whose destination
+is the merchant's nano_ address IS the settlement. No facilitator, no gas, no
 token account, no relay. The merchant needs only its public address.
 
-Audit invariant (payee binds): the proof of settlement lives on the
-merchant's own chain, not on a hash the payer chose to show. So verification
-does two independent reads of the public ledger:
-  1. the payer-named block: its amount and destination must match exactly; and
-  2. the merchant's account history: the same block must appear among the
-     merchant's real incoming receive-blocks of that exact amount.
-The payer's hash is a HINT, never the proof. Settlement is only "confirmed"
-when the block the customer names is also a receive the merchant actually
-holds. A payer can then re-derive the same link by reading the merchant's
-public account, and neither side controls the other's view of the chain.
+The invoice from ``create_nano_invoice`` asks the customer to confirm with the
+hash of their SEND block. That block lives on the customer's account chain, so
+its ``block_account`` is the sender, not the merchant. Verification therefore
+reads that one block from the public ledger and checks the block itself:
+
+  1. it is a state block with subtype ``send``;
+  2. its destination (``link_as_account``) is the merchant's address;
+  3. its amount in raw is at least the invoiced raw amount; and
+  4. the network has confirmed it (``confirmed == "true"``).
+
+It does not require the merchant to have published a receive block: once a
+send is confirmed the funds are the merchant's, receivable whenever its wallet
+pockets them. Every missing field, unexpected value or RPC failure returns a
+non-"confirmed" answer (fail closed).
+
+This proves a payment to the merchant happened. It does not by itself stop a
+customer reusing one old send hash for a second order; a deployer that needs
+that should record each confirmed hash and refuse repeats.
 """
 
 from __future__ import annotations
 
-import urllib.request
 import json
+import re
+import urllib.request
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
-# Public Nano RPC (no key required for read-only block_info/account_history).
+# Public Nano RPC (no key required for read-only block_info).
 # Swap for a configured node URL if the deployer prefers one.
 RPC_URL = "https://rpc.nano.to"
 # rpc.nano.to refuses requests with no User-Agent (HTTP 403), so send one.
 _USER_AGENT = "langgraph-sales-agent-nano-leg/1.0"
+
+_BLOCK_HASH = re.compile(r"^[0-9A-Fa-f]{64}$")
 
 
 def _rpc(method: str, params: dict):
@@ -46,89 +57,83 @@ def _rpc(method: str, params: dict):
         return json.loads(resp.read().decode())
 
 
+def _account_key(address: str | None) -> str | None:
+    """Compare addresses without the nano_/xrb_ prefix (same key, two spellings)."""
+    if not isinstance(address, str):
+        return None
+    for prefix in ("nano_", "xrb_"):
+        if address.startswith(prefix):
+            return address[len(prefix):]
+    return None
+
+
+def check_send_block(info, merchant: str, expected_raw: int) -> str:
+    """Return "confirmed" only if ``info`` (a block_info result) pays the merchant.
+
+    Pure function so it can be tested without a network.
+    """
+    if not isinstance(info, dict):
+        return "could-not-verify: unexpected RPC response"
+    if info.get("error"):
+        return "not-yet: block not found (still pending or invalid hash)"
+
+    contents = info.get("contents")
+    if not isinstance(contents, dict):
+        contents = {}
+
+    subtype = info.get("subtype")
+    if subtype != "send":
+        return (
+            f"not-a-send: block subtype is {subtype!r}; confirm with the hash "
+            "of the send block that paid the invoice"
+        )
+
+    destination = info.get("link_as_account") or contents.get("link_as_account")
+    merchant_key = _account_key(merchant)
+    if merchant_key is None or _account_key(destination) != merchant_key:
+        return "wrong-destination: the send was not to the merchant address"
+
+    try:
+        amount_raw = int(str(info["amount"]))
+    except (KeyError, TypeError, ValueError):
+        return "could-not-verify: block has no readable amount"
+    if amount_raw < expected_raw:
+        return (
+            f"amount-short: got {amount_raw} raw, invoice required "
+            f"{expected_raw} raw. Do not release the order."
+        )
+
+    if info.get("confirmed") != "true":
+        return "not-yet: send block is not confirmed by the network yet"
+
+    return "confirmed"
+
+
 @tool
 def verify_nano_block(
     block_hash: str, expected_raw: int, config: RunnableConfig
 ) -> str:
-    """Confirm a Nano payment against the merchant's receivable on-chain.
+    """Confirm a Nano payment from the hash of the customer's send block.
+
+    Returns "confirmed" only when that block is a network-confirmed send to the
+    merchant address of at least the invoiced raw amount. Any other answer
+    means the order must not be released yet.
 
     Args:
-        block_hash: The send/receive block hash the customer provided. This is
-            a hint used to cross-check, never the proof on its own.
-        expected_raw: The exact raw amount the invoice required.
+        block_hash: The hash of the send block the customer made to pay.
+        expected_raw: The raw amount the invoice required.
     """
     merchant = config["configurable"]["merchant_nano_address"]
+    if not isinstance(block_hash, str) or not _BLOCK_HASH.match(block_hash.strip()):
+        return "bad-hash: expected a 64-character hex block hash"
     try:
-        info = _rpc("block_info", {"json_block": "true", "hash": block_hash})
+        expected = int(expected_raw)
+    except (TypeError, ValueError):
+        return "could-not-verify: invoice amount is not an integer raw value"
+    if expected <= 0:
+        return "could-not-verify: invoice amount must be positive"
+    try:
+        info = _rpc("block_info", {"json_block": "true", "hash": block_hash.strip()})
     except Exception as exc:  # network / RPC failure is not a confirmation
         return f"could-not-verify: {exc}"
-
-    if info.get("error"):
-        return "not-yet: block not found (still pending or invalid hash)"
-
-    # 1. The payer-named block must be an exact-amount receive to the merchant.
-    amount_raw = int(info.get("amount", 0))
-    if amount_raw != expected_raw:
-        return (
-            f"amount-mismatch: got {amount_raw} raw, invoice required "
-            f"{expected_raw} raw. Do not release the order."
-        )
-    # A block's owning account is `block_account` on a modern node; some nodes
-    # expose it only under contents.account. Read either, never assume `account`.
-    block_owner = info.get("block_account") or (info.get("contents") or {}).get("account")
-    if block_owner != merchant:
-        return "wrong-destination: block was not received to the merchant address"
-
-    # 2. The payee-bound proof: the exact-amount receive must ALSO appear in
-    #    the merchant's own account history, independent of the payer's claim.
-    #    An open block (an account's first receive) is the OLDEST entry, so a
-    #    single fixed window can never see it — walk the history in pages.
-    try:
-        found = _history_has_receive(merchant, block_hash, expected_raw, info.get("source"))
-    except Exception as exc:
-        # History read failed but the block itself is sound: trust the
-        # direct block_info only if history is temporarily unavailable.
-        return (
-            f"audit-incomplete: history unreadable ({exc}); "
-            f"block hash {block_hash} amount OK"
-        )
-    if not found:
-        return (
-            "not-in-merchant-history: the named block is not one of the "
-            "merchant's real receives of that exact amount. A payer cannot "
-            "bind settlement with a hash the merchant never received."
-        )
-    return "confirmed"
-
-
-def _history_has_receive(
-    merchant: str, block_hash: str, expected_raw: int, source: str | None
-) -> bool:
-    """Walk the merchant's account history looking for a matching receive.
-
-    Pages until the named hash is found (as a receive of the exact amount) or
-    the history is exhausted. Stops after a bounded number of pages so a huge
-    account cannot hang the tool; a receive older than that is not settlement
-    for a fresh invoice anyway.
-    """
-    cursor = None
-    for _ in range(20):  # up to 20 * 100 = 2000 blocks back
-        params = {"account": merchant, "count": 100, "raw": "true"}
-        if cursor:
-            params["head"] = cursor
-        page = _rpc("account_history", params)
-        if not isinstance(page, dict) or page.get("error") or not page.get("history"):
-            return False
-        history = page["history"]
-        for h in history:
-            if h.get("type") != "receive":
-                continue
-            if str(h.get("amount", "")) != str(expected_raw):
-                continue
-            if h.get("hash") == block_hash or (source and h.get("hash") == source):
-                return True
-        # A short page means we reached the account's open block: stop.
-        if len(history) < 100:
-            return False
-        cursor = history[-1].get("hash")
-    return False
+    return check_send_block(info, merchant, expected)
