@@ -28,6 +28,7 @@ class SalesAgentState(TypedDict):
     product_images: list[str]
     channel: str
     channel_user_id: str
-    # --- nano accept-leg (generated) ---
-    pending_invoice: dict  # {block_hash, raw, merchant} of the open invoice
+    # --- Nano (XNO) payment ---
+    pending_invoice: dict  # {raw (decimal str), merchant, block_hash} of the open invoice
     confirmed_payment: bool  # True only after verify_nano_block == confirmed
+    order_released: bool  # Set only by release_order after confirmed_payment
