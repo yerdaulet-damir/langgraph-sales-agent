@@ -142,7 +142,7 @@ enterprise-agents/sales/
 
 ```bash
 git clone https://github.com/yerdaulet-damir/langgraph-sales-agent
-cd enterprise-sales-agent
+cd langgraph-sales-agent
 
 python -m venv .venv && source .venv/bin/activate
 pip install -e .

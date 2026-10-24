@@ -77,3 +77,6 @@ eval_sales_test.py
 # Internal agent workflow files (Antigravity)
 .agent/
 .claude/
+
+# Stray downloaded artifacts
+# Page Not Found

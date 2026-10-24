@@ -38,7 +38,10 @@ def _build_system_prompt(tenant_id: str, channel: str | None = None) -> str:
         "NEVER use markdown image syntax like ![](url). "
         "The send_product_image tool handles rendering on the customer's device.\n"
         "- When the customer says 'покажи', 'фото', 'show', or similar — "
-        "call send_product_image for each relevant product."
+        "call send_product_image for each relevant product.\n"
+        "- For a Nano (XNO) payment, call create_nano_invoice, then verify_nano_block "
+        "with the hash of the customer's send block. NEVER tell the customer the "
+        "order is paid or released unless verify_nano_block returned exactly 'confirmed'."
     )
 
     channel_hint = f"You are chatting on {channel}.\n\n" if channel else ""
